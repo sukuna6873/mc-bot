@@ -132,8 +132,9 @@ function connectBot() {
   });
 
   client.on("death_info", async (packet) => {
+    if (!isConnected) return;
     console.log(`[DEBUG] Death info:`, JSON.stringify(packet));
-    client.close();
+    try { client.close(); } catch (_) {}
     isConnected = false;
     client = null;
     console.log("Bot died. Reconnecting in 30 seconds...");
@@ -142,8 +143,9 @@ function connectBot() {
   });
 
   client.on("disconnect", async (packet) => {
+    if (!isConnected) return;
     console.log(`[DEBUG] Disconnect packet:`, JSON.stringify(packet));
-    client.close();
+    try { client.close(); } catch (_) {}
     isConnected = false;
     client = null;
     console.log(
@@ -153,7 +155,31 @@ function connectBot() {
     connectBot();
   });
 
-  client.on("error", (err) => console.error("Client error:", err.message));
+  client.on("error", (err) => {
+    console.error("Client error:", err.message);
+  });
+
+  client.on("close", async () => {
+    if (!isConnected) return;
+    console.log("Client connection closed unexpectedly.");
+    try { client.close(); } catch (_) {}
+    isConnected = false;
+    client = null;
+    console.log("Bot lost connection. Reconnecting in 30 seconds...");
+    await new Promise((resolve) => setTimeout(resolve, 30000));
+    connectBot();
+  });
+
+  client.on("end", async () => {
+    if (!isConnected) return;
+    console.log("Client stream ended.");
+    try { client.close(); } catch (_) {}
+    isConnected = false;
+    client = null;
+    console.log("Bot stream ended. Reconnecting in 30 seconds...");
+    await new Promise((resolve) => setTimeout(resolve, 30000));
+    connectBot();
+  });
 }
 
 async function getServerStatus() {

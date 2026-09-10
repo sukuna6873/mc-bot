@@ -4,44 +4,69 @@ import express from "express";
 import OpenAI from "openai";
 
 const app = express();
-let client;
+
+let client = null;
 let isConnected = false;
+let reconnectTimer = null;
+let reconnecting = false;
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
   baseURL: process.env.OPENAI_BASE_URL,
 });
 
+// =========================
+// AI
+// =========================
+
 async function askAI(query) {
   try {
+    console.log(`[AI] Asking: ${query}`);
+
     const completion = await openai.chat.completions.create({
       model: "gpt-3.5-turbo",
+
       messages: [
         {
           role: "system",
           content:
-            "You are a helpful Minecraft assistant. Keep answers short and concise (under 100 characters). Answer based on Minecraft Bedrock edition version 1.26.45 knowledge (dont use special characters in your answers like emoji, markdown, etc use only text).",
+            "You are a helpful Minecraft assistant. Keep answers short and concise under 100 characters. Answer based on Minecraft Bedrock Edition version 1.26.45 knowledge. Use only plain text. No emojis. No markdown. No special characters.",
         },
-        { role: "user", content: query },
+        {
+          role: "user",
+          content: query,
+        },
       ],
+
       max_tokens: 200,
       temperature: 0.7,
     });
-    return (
-      completion.choices[0]?.message?.content?.trim() || "No response from AI."
-    );
+
+    const answer =
+      completion.choices[0]?.message?.content?.trim() ||
+      "No response from AI.";
+
+    console.log(`[AI] Response: ${answer}`);
+
+    return answer;
   } catch (err) {
-    console.error("AI API error:", err?.message);
+    console.error("[AI ERROR]", err?.message ?? err);
+
     return "Sorry, I couldn't process your request right now.";
   }
 }
 
+// =========================
+// SEND CHAT
+// =========================
+
 function sendChat(message) {
   try {
-    if (!client) {
-      console.error("Cannot send chat: client is not connected");
+    if (!client || !isConnected) {
+      console.error("[CHAT] Cannot send chat: bot is not connected");
       return;
     }
+
     client.queue("text", {
       needs_translation: false,
       category: "authored",
@@ -52,342 +77,590 @@ function sendChat(message) {
       platform_chat_id: "",
       has_filtered_message: false,
     });
+
     console.log(`[SENT] ${message}`);
   } catch (err) {
-    console.error("Error sending chat:", err?.message ?? err);
+    console.error("[CHAT ERROR]", err?.message ?? err);
   }
 }
 
+// =========================
+// SPLIT MESSAGE
+// =========================
+
 function splitMessage(text, maxLen = 150) {
-  if (text.length <= maxLen) return [text];
+  if (!text || text.length <= maxLen) {
+    return [text || ""];
+  }
+
   const chunks = [];
   let remaining = text;
+
   while (remaining.length > 0) {
     if (remaining.length <= maxLen) {
       chunks.push(remaining);
       break;
     }
+
     let cut = remaining.lastIndexOf(" ", maxLen);
-    if (cut === -1 || cut === 0) cut = maxLen;
+
+    if (cut === -1 || cut === 0) {
+      cut = maxLen;
+    }
+
     chunks.push(remaining.slice(0, cut));
+
     remaining = remaining.slice(cut).trim();
   }
+
   return chunks;
 }
 
+// =========================
+// RECONNECT
+// =========================
+
+function scheduleReconnect(reason = "unknown reason") {
+  // Prevent multiple reconnect timers
+  if (reconnectTimer || reconnecting) {
+    console.log("[RECONNECT] Already scheduled. Ignoring duplicate event.");
+    return;
+  }
+
+  isConnected = false;
+
+  console.log(`[RECONNECT] Reason: ${reason}`);
+  console.log("[RECONNECT] Reconnecting in 30 seconds...");
+
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    reconnecting = false;
+
+    console.log("[RECONNECT] Attempting to reconnect...");
+
+    client = null;
+
+    connectBot();
+  }, 30000);
+
+  reconnecting = true;
+}
+
+// =========================
+// CONNECT BOT
+// =========================
+
 function connectBot() {
-  client = bedrockProtocol.createClient({
-    host: process.env.MC_HOST, // Minecraft server IP or hostname
-    port: Number(process.env.MC_PORT), // Minecraft server port
-    username: process.env.MC_USERNAME, // Minecraft username
-    offline: process.env.MC_OFFLINE === "true", // set to true for offline mode
-    profilesFolder: "./profiles", // stores login tokens
-  });
+  // Don't create multiple clients
+  if (client) {
+    console.log("[BOT] Client already exists. Skipping connection.");
+    return;
+  }
+
+  console.log("[BOT] Connecting to Minecraft server...");
+
+  try {
+    client = bedrockProtocol.createClient({
+      host: process.env.MC_HOST,
+      port: Number(process.env.MC_PORT),
+      username: process.env.MC_USERNAME,
+      offline: process.env.MC_OFFLINE === "true",
+      profilesFolder: "./profiles",
+    });
+  } catch (err) {
+    console.error("[BOT] Failed to create client:", err?.message ?? err);
+
+    client = null;
+    isConnected = false;
+
+    scheduleReconnect("failed to create client");
+
+    return;
+  }
+
+  // =========================
+  // CONNECT
+  // =========================
 
   client.on("connect", () => {
-    console.log("Connected to the server!");
+    console.log("[BOT] Connected to Minecraft server.");
   });
 
+  // =========================
+  // JOIN
+  // =========================
+
   client.on("join", () => {
-    console.log("Bot spawned!");
+    console.log("[BOT] Bot spawned successfully.");
+
     isConnected = true;
+    reconnecting = false;
+
+    console.log("[BOT] Ready to receive chat messages.");
   });
+
+  // =========================
+  // CHAT
+  // =========================
 
   client.on("text", async (packet) => {
     try {
       console.log(
-        `[DEBUG] Text event: type=${packet.type} from=${packet.source_name} msg=${packet.message}`,
+        `[DEBUG] Text event: type=${packet.type} from=${packet.source_name} msg=${packet.message}`
       );
 
-      if (packet.type !== "chat") return;
-      if (packet.source_name === client.username) return;
+      // Only process normal chat
+      if (packet.type !== "chat") {
+        return;
+      }
+
+      // Make sure client still exists
+      if (!client) {
+        return;
+      }
+
+      // Ignore bot's own messages
+      if (packet.source_name === client.username) {
+        return;
+      }
 
       const msg = packet.message?.trim() || "";
-      if (!msg.toLowerCase().startsWith("bot ")) return;
+
+      // Command must start with "bot "
+      if (!msg.toLowerCase().startsWith("bot ")) {
+        return;
+      }
 
       const question = msg.slice(4).trim();
+
       if (!question) {
         sendChat("Usage: bot <question>");
         return;
       }
 
-      console.log(`[GAME] ${packet.source_name} asked: ${question}`);
+      console.log(
+        `[GAME] ${packet.source_name} asked: ${question}`
+      );
+
+      // =========================
+      // ASK AI
+      // =========================
+
+      console.log("[AI] Sending request...");
 
       const answer = await askAI(question);
+
       console.log(`[GAME] AI answer: ${answer}`);
+
+      // =========================
+      // SEND RESPONSE
+      // =========================
 
       const parts = splitMessage(answer);
 
       for (let i = 0; i < parts.length; i++) {
+        // Check connection before sending
+        if (!client || !isConnected) {
+          console.log(
+            "[CHAT] Bot disconnected before response could be sent."
+          );
+          break;
+        }
+
         sendChat(parts[i]);
+
+        // Delay between multiple messages
         if (i < parts.length - 1) {
-          await new Promise((r) => setTimeout(r, 1000));
+          await new Promise((resolve) =>
+            setTimeout(resolve, 1000)
+          );
         }
       }
 
-      console.log(`[GAME] Replied to ${packet.source_name}: ${answer}`);
+      console.log(
+        `[GAME] Replied to ${packet.source_name}: ${answer}`
+      );
     } catch (err) {
-      console.error("Error handling text event:", err?.message ?? err);
+      console.error(
+        "[CHAT ERROR]",
+        err?.message ?? err
+      );
     }
   });
 
-  client.on("death_info", async (packet) => {
-    if (!isConnected) return;
-    console.log(`[DEBUG] Death info:`, JSON.stringify(packet));
-    try { client.close(); } catch (_) {}
+  // =========================
+  // DEATH
+  // =========================
+
+  client.on("death_info", (packet) => {
+    console.log(
+      "[BOT] Death info:",
+      JSON.stringify(packet)
+    );
+
     isConnected = false;
-    client = null;
-    console.log("Bot died. Reconnecting in 30 seconds...");
-    await new Promise((resolve) => setTimeout(resolve, 30000));
-    connectBot();
+
+    scheduleReconnect("bot died");
   });
 
-  client.on("disconnect", async (packet) => {
-    if (!isConnected) return;
-    console.log(`[DEBUG] Disconnect packet:`, JSON.stringify(packet));
-    try { client.close(); } catch (_) {}
-    isConnected = false;
-    client = null;
+  // =========================
+  // DISCONNECT
+  // =========================
+
+  client.on("disconnect", (packet) => {
     console.log(
-      `Bot disconnected: ${packet.reason || "unknown reason"}. Reconnecting in 30 seconds...`,
+      "[BOT] Disconnect packet:",
+      JSON.stringify(packet)
     );
-    await new Promise((resolve) => setTimeout(resolve, 30000));
-    connectBot();
+
+    isConnected = false;
+
+    scheduleReconnect(
+      packet?.reason || "Minecraft disconnected"
+    );
   });
+
+  // =========================
+  // CLOSE
+  // =========================
+
+  client.on("close", () => {
+    console.log("[BOT] Client connection closed.");
+
+    isConnected = false;
+
+    // IMPORTANT:
+    // DO NOT call client.close() here.
+    //
+    // Calling client.close() inside the close event
+    // causes:
+    //
+    // close -> close() -> close -> close() -> ...
+    //
+    // which caused your Maximum call stack size exceeded error.
+
+    scheduleReconnect("connection closed");
+  });
+
+  // =========================
+  // END
+  // =========================
+
+  client.on("end", () => {
+    console.log("[BOT] Client stream ended.");
+
+    isConnected = false;
+
+    scheduleReconnect("stream ended");
+  });
+
+  // =========================
+  // ERROR
+  // =========================
 
   client.on("error", (err) => {
-    console.error("Client error:", err.message);
-  });
+    console.error(
+      "[BOT ERROR]",
+      err?.message ?? err
+    );
 
-  client.on("close", async () => {
-    if (!isConnected) return;
-    console.log("Client connection closed unexpectedly.");
-    try { client.close(); } catch (_) {}
-    isConnected = false;
-    client = null;
-    console.log("Bot lost connection. Reconnecting in 30 seconds...");
-    await new Promise((resolve) => setTimeout(resolve, 30000));
-    connectBot();
-  });
-
-  client.on("end", async () => {
-    if (!isConnected) return;
-    console.log("Client stream ended.");
-    try { client.close(); } catch (_) {}
-    isConnected = false;
-    client = null;
-    console.log("Bot stream ended. Reconnecting in 30 seconds...");
-    await new Promise((resolve) => setTimeout(resolve, 30000));
-    connectBot();
+    // Don't immediately reconnect here.
+    //
+    // Usually disconnect/close/end will follow.
+    // If they don't, the process can remain alive
+    // and we don't want duplicate reconnect attempts.
   });
 }
+
+// =========================
+// SERVER STATUS
+// =========================
 
 async function getServerStatus() {
   const host = process.env.MC_HOST;
   const port = Number(process.env.MC_PORT);
-  const platform = process.env.MC_PLATFORM || "bedrock"; // Default to "bedrock" if not specified
-  const url = `https://minecraft-serverhub.com/api/ping?host=${host}&port=${port}&platform=${platform}`;
+  const platform =
+    process.env.MC_PLATFORM || "bedrock";
+
+  const url =
+    `https://minecraft-serverhub.com/api/ping` +
+    `?host=${encodeURIComponent(host)}` +
+    `&port=${port}` +
+    `&platform=${encodeURIComponent(platform)}`;
 
   try {
     const res = await fetch(url);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status}`);
+    }
+
     return await res.json();
   } catch (err) {
-    console.error("Failed to fetch server status:", err.message);
+    console.error(
+      "[STATUS] Failed to fetch server status:",
+      err?.message ?? err
+    );
+
     return null;
   }
 }
+
+// =========================
+// HOME PAGE
+// =========================
 
 app.get("/", async (_, res) => {
   try {
     const status = await getServerStatus();
 
     const botStatus = isConnected
-      ? "Bot is connected 🤖"
-      : "Bot is disconnected ❌";
+      ? "Bot is connected"
+      : "Bot is disconnected";
 
     const serverOnline = status?.online ?? false;
 
     res.send(`
-    <!DOCTYPE html>
-    <html lang="en">
-    <head>
-      <meta charset="UTF-8" />
-      <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<!DOCTYPE html>
+<html lang="en">
 
-      <title>Minecraft Bot Status</title>
+<head>
+  <meta charset="UTF-8" />
 
-      <style>
-        * {
-          box-sizing: border-box;
-          margin: 0;
-          padding: 0;
-        }
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+  />
 
-        body {
-          font-family: Arial, sans-serif;
-          background: #0f172a;
-          color: #e2e8f0;
-          min-height: 100vh;
-          display: flex;
-          justify-content: center;
-          align-items: center;
-          padding: 20px;
-        }
+  <title>Minecraft Bot Status</title>
 
-        .container {
-          width: 100%;
-          max-width: 600px;
-        }
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
 
-        h1 {
-          text-align: center;
-          margin-bottom: 25px;
-          font-size: 32px;
-        }
+    body {
+      font-family: Arial, sans-serif;
+      background: #0f172a;
+      color: #e2e8f0;
+      min-height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 20px;
+    }
 
-        .card {
-          background: #1e293b;
-          border: 1px solid #334155;
-          border-radius: 16px;
-          padding: 24px;
-          margin-bottom: 16px;
-          box-shadow: 0 10px 30px rgba(0, 0, 0, 0.25);
-        }
+    .container {
+      width: 100%;
+      max-width: 600px;
+    }
 
-        .card h2 {
-          margin-bottom: 18px;
-          font-size: 20px;
-        }
+    h1 {
+      text-align: center;
+      margin-bottom: 25px;
+      font-size: 32px;
+    }
 
-        .status {
-          display: flex;
-          align-items: center;
-          gap: 10px;
-          font-size: 18px;
-          font-weight: bold;
-        }
+    .card {
+      background: #1e293b;
+      border: 1px solid #334155;
+      border-radius: 16px;
+      padding: 24px;
+      margin-bottom: 16px;
+      box-shadow:
+        0 10px 30px rgba(0, 0, 0, 0.25);
+    }
 
-        .online {
-          color: #22c55e;
-        }
+    .card h2 {
+      margin-bottom: 18px;
+      font-size: 20px;
+    }
 
-        .offline {
-          color: #ef4444;
-        }
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 18px;
+      font-weight: bold;
+    }
 
-        .info {
-          display: flex;
-          justify-content: space-between;
-          padding: 10px 0;
-          border-bottom: 1px solid #334155;
-        }
+    .online {
+      color: #22c55e;
+    }
 
-        .info:last-child {
-          border-bottom: none;
-        }
+    .offline {
+      color: #ef4444;
+    }
 
-        .label {
-          color: #94a3b8;
-        }
+    .info {
+      display: flex;
+      justify-content: space-between;
+      padding: 10px 0;
+      border-bottom: 1px solid #334155;
+      gap: 20px;
+    }
 
-        .value {
-          font-weight: bold;
-          text-align: right;
-        }
+    .info:last-child {
+      border-bottom: none;
+    }
 
-        .motd {
-          white-space: pre-line;
-        }
+    .label {
+      color: #94a3b8;
+    }
 
-        .refresh {
-          text-align: center;
-          color: #64748b;
-          font-size: 14px;
-          margin-top: 15px;
-        }
-      </style>
-    </head>
+    .value {
+      font-weight: bold;
+      text-align: right;
+    }
 
-    <body>
-      <div class="container">
+    .motd {
+      white-space: pre-line;
+      word-break: break-word;
+    }
 
-        <h1>🎮 Minecraft Server</h1>
+    .refresh {
+      text-align: center;
+      color: #64748b;
+      font-size: 14px;
+      margin-top: 15px;
+    }
+  </style>
+</head>
 
-        <!-- Bot Status -->
-        <div class="card">
-          <h2>🤖 Bot Status</h2>
+<body>
 
-          <div class="status ${isConnected ? "online" : "offline"}">
-            <span>
-              ${botStatus}
-            </span>
-          </div>
-        </div>
+  <div class="container">
 
-        <!-- Server Status -->
-        <div class="card">
-          <h2>🌐 Server Status</h2>
+    <h1>Minecraft Server</h1>
 
-          <div class="info">
-            <span class="label">Status</span>
-            <span class="value ${serverOnline ? "online" : "offline"}">
-              ${serverOnline ? "🟢 Online" : "🔴 Offline"}
-            </span>
-          </div>
+    <!-- Bot Status -->
 
-          <div class="info">
-            <span class="label">Players</span>
-            <span class="value">
-              ${status?.players?.online ?? 0}
-              /
-              ${status?.players?.max ?? 0}
-            </span>
-          </div>
+    <div class="card">
 
-          <div class="info">
-            <span class="label">Version</span>
-            <span class="value">
-              ${status?.version ?? "Unknown"}
-            </span>
-          </div>
+      <h2>Bot Status</h2>
 
-          <div class="info">
-            <span class="label">Ping</span>
-            <span class="value">
-              ${status?.ping ?? "N/A"} ms
-            </span>
-          </div>
-
-          <div class="info">
-            <span class="label">MOTD</span>
-            <span class="value motd">
-              ${status?.motd ?? "Unknown"}
-            </span>
-          </div>
-        </div>
-
-        <div class="refresh">
-          Page generated at ${new Date().toLocaleString()}
-        </div>
-
+      <div
+        class="status ${isConnected ? "online" : "offline"}"
+      >
+        <span>
+          ${botStatus}
+        </span>
       </div>
-    </body>
-    </html>
-  `);
+
+    </div>
+
+    <!-- Server Status -->
+
+    <div class="card">
+
+      <h2>Server Status</h2>
+
+      <div class="info">
+        <span class="label">
+          Status
+        </span>
+
+        <span
+          class="value ${serverOnline ? "online" : "offline"}"
+        >
+          ${serverOnline ? "Online" : "Offline"}
+        </span>
+      </div>
+
+      <div class="info">
+        <span class="label">
+          Players
+        </span>
+
+        <span class="value">
+          ${status?.players?.online ?? 0}
+          /
+          ${status?.players?.max ?? 0}
+        </span>
+      </div>
+
+      <div class="info">
+        <span class="label">
+          Version
+        </span>
+
+        <span class="value">
+          ${status?.version ?? "Unknown"}
+        </span>
+      </div>
+
+      <div class="info">
+        <span class="label">
+          Ping
+        </span>
+
+        <span class="value">
+          ${status?.ping ?? "N/A"} ms
+        </span>
+      </div>
+
+      <div class="info">
+        <span class="label">
+          MOTD
+        </span>
+
+        <span class="value motd">
+          ${status?.motd ?? "Unknown"}
+        </span>
+      </div>
+
+    </div>
+
+    <div class="refresh">
+      Page generated at
+      ${new Date().toLocaleString()}
+    </div>
+
+  </div>
+
+</body>
+</html>
+    `);
   } catch (err) {
-    console.error("Failed to fetch server status:", err.message ?? err);
-    res.status(500).send("Failed to fetch server status");
+    console.error(
+      "[HTTP] Failed to fetch server status:",
+      err?.message ?? err
+    );
+
+    res
+      .status(500)
+      .send("Failed to fetch server status");
   }
 });
 
-app.head("/health", (_, res) => res.sendStatus(200));
-app.get("/health", (_, res) => res.sendStatus(200));
+// =========================
+// HEALTH CHECK
+// =========================
+
+app.head("/health", (_, res) => {
+  res.sendStatus(200);
+});
+
+app.get("/health", (_, res) => {
+  res.sendStatus(200);
+});
+
+// =========================
+// START BOT
+// =========================
 
 connectBot();
+
+// =========================
+// START EXPRESS
+// =========================
 
 const PORT = Number(process.env.PORT) || 10000;
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`HTTP server started on port ${PORT}`);
+  console.log(
+    `[HTTP] Server started on port ${PORT}`
+  );
 });

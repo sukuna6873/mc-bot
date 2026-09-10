@@ -1,0 +1,19 @@
+{
+  "name": "test",
+  "version": "1.0.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "bedrock-protocol": "^3.59.0",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "openai": "^7.13.0"
+  }
+}
